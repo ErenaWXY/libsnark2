@@ -1,150 +1,78 @@
-// server/index.js
+// server/index.js (TLS 1.3 ONLY - Requirement 2a)
 import express from "express";
 import cors from "cors";
 import multer from "multer";
 import { v4 as uuid } from "uuid";
 import path from "path";
 import fs from "fs";
-import crypto from "crypto";
-
-import { mlkemKeypair, mlkemDecapsulate } from "./pqkem.js";
+import https from "https";
 
 const app = express();
 const PORT = 4000;
 
-app.use(cors({ origin: "http://localhost:5173" })); // adjust for your FE origin
+// If Vite runs at http://localhost:5173 keep this.
+// If you switch Vite to https later, change accordingly.
+app.use(cors({ origin: "http://localhost:5173" }));
 app.use(express.json({ limit: "2mb" }));
 
-const uploadDisk = multer({ dest: "uploads_tmp" });
+// Use memory upload; we will write plaintext to disk ourselves
 const uploadMem = multer({ storage: multer.memoryStorage() });
 
 const UPLOAD_DIR = path.resolve("uploads_plain");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// Simple in-memory “DB”
+// In-memory metadata store
 const files = new Map();
-
-// Store server-side ML-KEM secret keys by keyId (short-lived)
-const kemKeys = new Map(); // keyId -> { sk: Uint8Array, pk: Uint8Array, createdAt: number }
-const KEM_TTL_MS = 10 * 60 * 1000; // 10 minutes
-
-function cleanupKemKeys() {
-  const now = Date.now();
-  for (const [keyId, obj] of kemKeys.entries()) {
-    if (now - obj.createdAt > KEM_TTL_MS) kemKeys.delete(keyId);
-  }
-}
 
 function safeName(name) {
   return String(name || "file.bin").replace(/[^a-zA-Z0-9._-]/g, "_");
 }
 
-function hkdfAesKey(sharedSecretBytes) {
-  // sharedSecretBytes: Buffer | Uint8Array
-  const ss = Buffer.from(sharedSecretBytes);
-  return crypto.hkdfSync(
-    "sha256",
-    ss,
-    Buffer.alloc(0),
-    Buffer.from("pq-upload-aes-256-key"),
-    32 // 32 bytes = AES-256
-  );
-}
-
-function decryptAes256Gcm({ key32, iv, ciphertext, tag }) {
-  const decipher = crypto.createDecipheriv("aes-256-gcm", key32, iv);
-  decipher.setAuthTag(tag);
-  const p1 = decipher.update(ciphertext);
-  const p2 = decipher.final();
-  return Buffer.concat([p1, p2]);
-}
-
-/**
- * PQ handshake: server generates a fresh ML-KEM keypair and returns pk to client.
- * Client does encapsulate(pk) -> (ct, ss) and sends ct + AES-GCM encrypted file.
- */
-app.get("/kem-pubkey", async (req, res) => {
-  cleanupKemKeys();
-
-  const { pk, sk } = await mlkemKeypair(); // Uint8Array, Uint8Array
-  const keyId = uuid();
-
-  kemKeys.set(keyId, { pk, sk, createdAt: Date.now() });
-
-  res.json({
-    keyId,
-    kem: "ML-KEM",
-    pkB64: Buffer.from(pk).toString("base64"),
-    ttlSeconds: Math.floor(KEM_TTL_MS / 1000),
-  });
+// Evidence for report: log TLS protocol & cipher for each request
+app.use((req, res, next) => {
+  const s = req.socket;
+  if (typeof s.getProtocol === "function") {
+    console.log("TLS protocol:", s.getProtocol()); // expect TLSv1.3
+    if (typeof s.getCipher === "function") console.log("TLS cipher:", s.getCipher());
+  }
+  next();
 });
 
 /**
- * Upload encrypted (PQ application-layer):
- * multipart form-data fields:
- * - keyId: string
- * - kemCtB64: base64(ML-KEM ciphertext)
- * - ivB64: base64(12 bytes)
- * - tagB64: base64(16 bytes)
- * - originalName: string
- * - cipher: file (binary)  <-- AES-GCM ciphertext without tag
+ * Upload PLAINTEXT over TLS (TLS provides encryption in transit).
+ * multipart form-data:
+ * - file: uploaded file (plaintext)
  */
-app.post("/upload-pq", uploadMem.single("cipher"), async (req, res) => {
+app.post("/upload", uploadMem.single("file"), async (req, res) => {
   try {
-    cleanupKemKeys();
+    if (!req.file?.buffer) return res.status(400).json({ error: "Missing file" });
 
-    const { keyId, kemCtB64, ivB64, tagB64, originalName } = req.body;
-    if (!keyId || !kemCtB64 || !ivB64 || !tagB64 || !req.file?.buffer) {
-      return res.status(400).json({ error: "Missing fields" });
-    }
-
-    const kemObj = kemKeys.get(keyId);
-    if (!kemObj) return res.status(404).json({ error: "KEM key expired/invalid" });
-
-    const kemCt = Buffer.from(kemCtB64, "base64");
-    const iv = Buffer.from(ivB64, "base64");
-    const tag = Buffer.from(tagB64, "base64");
-    const ciphertext = Buffer.from(req.file.buffer);
-
-    if (iv.length !== 12) return res.status(400).json({ error: "IV must be 12 bytes" });
-    if (tag.length !== 16) return res.status(400).json({ error: "Tag must be 16 bytes" });
-
-    // Decapsulate -> shared secret
-    const sharedSecret = await mlkemDecapsulate(new Uint8Array(kemCt), kemObj.sk);
-
-    // Derive AES-256 key
-    const key32 = hkdfAesKey(sharedSecret);
-
-    // Decrypt to plaintext (stored unencrypted)
-    const plaintext = decryptAes256Gcm({ key32, iv, ciphertext, tag });
-
-    // Save plaintext on disk
     const id = uuid();
-    const safeOriginal = safeName(originalName);
-    const storedName = `${id}__${safeOriginal}`;
+    const originalName = safeName(req.file.originalname || "file.bin");
+    const storedName = `${id}__${originalName}`;
     const outPath = path.join(UPLOAD_DIR, storedName);
-    fs.writeFileSync(outPath, plaintext);
 
-    files.set(id, {
+    // Store plaintext on disk (requirement: unencrypted server-side)
+    fs.writeFileSync(outPath, req.file.buffer);
+
+    const meta = {
       id,
-      originalName: safeOriginal,
+      originalName,
       storedName,
-      size: plaintext.length,
+      size: req.file.buffer.length,
       uploadedAt: new Date().toISOString(),
-    });
-
-    // one-time use keyId (recommended)
-    kemKeys.delete(keyId);
+    };
+    files.set(id, meta);
 
     res.json({
       id,
-      name: safeOriginal,
-      size: plaintext.length,
-      downloadUrl: `http://localhost:${PORT}/files/${id}`,
+      name: originalName,
+      size: meta.size,
+      downloadUrl: `https://localhost:${PORT}/files/${id}`,
     });
   } catch (e) {
     console.error(e);
-    res.status(500).json({ error: "Decrypt/upload failed" });
+    res.status(500).json({ error: "Upload failed" });
   }
 });
 
@@ -164,4 +92,16 @@ app.get("/files/:id", (req, res) => {
   res.download(filePath, meta.originalName);
 });
 
-app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));
+// TLS 1.3 HTTPS server
+const tlsOptions = {
+  pfx: fs.readFileSync(path.resolve("certs/localhost.pfx")),
+  passphrase: process.env.TLS_PFX_PASSPHRASE || "changeit",
+  minVersion: "TLSv1.3",
+  maxVersion: "TLSv1.3",
+  // TLS 1.3 AES-256-GCM suite (good evidence for AES-256 in transit)
+  ciphersuites: ["TLS_AES_256_GCM_SHA384"],
+};
+
+https.createServer(tlsOptions, app).listen(PORT, () => {
+  console.log(`TLS1.3 server running on https://localhost:${PORT}`);
+});
