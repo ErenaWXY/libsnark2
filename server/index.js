@@ -400,4 +400,34 @@ app.get("/files/:id", requireAuth, (req, res) => {
   }
 });
 
+// Delete file (remove from disk + remove metadata)
+app.delete("/files/:id", requireAuth, (req, res) => {
+  try {
+    const meta = db.files[req.params.id];
+    if (!meta) return res.status(404).json({ error: "Not found" });
+    if (meta.ownerClientId !== req.client.clientId) return res.status(403).json({ error: "Forbidden" });
+
+    // Remove file on disk depending on state
+    try {
+      if (meta.state === "PLAINTEXT") {
+        if (meta.plainPath && fs.existsSync(meta.plainPath)) fs.unlinkSync(meta.plainPath);
+      } else if (meta.state === "ENCRYPTED_AT_REST") {
+        if (meta.encPath && fs.existsSync(meta.encPath)) fs.unlinkSync(meta.encPath);
+      }
+    } catch (e) {
+      // ignore disk delete errors for demo
+      console.warn("[delete] disk remove warning:", e?.message || e);
+    }
+
+    // Remove metadata
+    delete db.files[req.params.id];
+    saveDb(db);
+
+    return res.json({ ok: true, id: req.params.id });
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Delete failed" });
+  }
+});
+
 app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));

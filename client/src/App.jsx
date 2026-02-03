@@ -54,7 +54,9 @@ function splitGcmTag(cipherWithTag) {
 }
 
 function bytesToHex(bytes) {
-  return Array.from(bytes).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return Array.from(bytes)
+    .map((b) => b.toString(16).padStart(2, "0"))
+    .join("");
 }
 
 async function sha512Hex(arrayBuffer) {
@@ -228,6 +230,23 @@ export default function App() {
     }
   }
 
+  async function deleteFile(fileId) {
+    try {
+      setStatus("Deleting…");
+      const r = await fetch(`${API}/files/${fileId}`, {
+        method: "DELETE",
+        headers: { ...authHeaders() },
+      });
+      const { json, text } = await readJsonSafe(r);
+      if (!r.ok) throw new Error(json?.error || text || "delete failed");
+      setStatus(`Deleted: ${fileId}`);
+      await refresh();
+    } catch (e) {
+      console.error(e);
+      setStatus(`Delete failed: ${e?.message || e}`);
+    }
+  }
+
   async function downloadAndVerify(f) {
     try {
       setStatus("Downloading…");
@@ -320,11 +339,24 @@ export default function App() {
               <button onClick={() => downloadAndVerify(f)} disabled={!token}>
                 Download + Verify
               </button>
+
               {f.state === "PLAINTEXT" && (
-                <button onClick={() => encryptAtRest(f.id)} style={{ marginLeft: 8 }} disabled={!token}>
+                <button
+                  onClick={() => encryptAtRest(f.id)}
+                  style={{ marginLeft: 8 }}
+                  disabled={!token}
+                >
                   Encrypt at rest (server)
                 </button>
               )}
+
+              <button
+                onClick={() => deleteFile(f.id)}
+                style={{ marginLeft: 8 }}
+                disabled={!token}
+              >
+                Delete
+              </button>
             </div>
           </li>
         ))}
