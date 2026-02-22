@@ -132,6 +132,32 @@ function sha512Hex(buf) {
   return crypto.createHash("sha512").update(buf).digest("hex");
 }
 
+function persistPlaintextUpload({ ownerClientId, originalName, plaintext }) {
+  const checksum = sha512Hex(plaintext);
+  const id = uuid();
+  const safeOriginal = safeName(originalName);
+  const storedName = `${id}__${safeOriginal}`;
+  const plainPath = path.join(UPLOAD_PLAIN_DIR, storedName);
+  fs.writeFileSync(plainPath, plaintext);
+
+  db.files[id] = {
+    id,
+    ownerClientId,
+    originalName: safeOriginal,
+    size: plaintext.length,
+    sha512: checksum,
+    state: "PLAINTEXT",
+    plainPath,
+    encPath: null,
+    encMeta: null,
+    uploadedAt: new Date().toISOString(),
+    encryptedAt: null,
+  };
+  saveDb(db);
+
+  return { id, name: safeOriginal, size: plaintext.length, sha512: checksum, state: "PLAINTEXT" };
+}
+
 // ---- Server-side encryption at rest (envelope) ----
 const KEK_FILE = path.resolve("kek.key");
 function loadOrCreateKek() {
@@ -186,6 +212,42 @@ function unwrapDek(encMeta) {
   return aesGcmDecrypt({ key32: KEK, iv, ciphertext, tag });
 }
 
+function persistEncryptedUpload({ ownerClientId, originalName, plaintext }) {
+  const checksum = sha512Hex(plaintext);
+  const id = uuid();
+  const safeOriginal = safeName(originalName);
+
+  const dek = crypto.randomBytes(32);
+  const { iv, ciphertext, tag } = aesGcmEncrypt({ key32: dek, plaintext });
+  const wrapped = wrapDek(dek);
+
+  const encName = `${id}__${safeOriginal}.enc`;
+  const encPath = path.join(UPLOAD_ENC_DIR, encName);
+  fs.writeFileSync(encPath, ciphertext);
+
+  db.files[id] = {
+    id,
+    ownerClientId,
+    originalName: safeOriginal,
+    size: plaintext.length,
+    sha512: checksum,
+    state: "ENCRYPTED_AT_REST",
+    plainPath: null,
+    encPath,
+    encMeta: {
+      alg: "AES-256-GCM",
+      fileIvB64: iv.toString("base64"),
+      fileTagB64: tag.toString("base64"),
+      ...wrapped,
+    },
+    uploadedAt: new Date().toISOString(),
+    encryptedAt: new Date().toISOString(),
+  };
+  saveDb(db);
+
+  return { id, name: safeOriginal, size: plaintext.length, sha512: checksum, state: "ENCRYPTED_AT_REST" };
+}
+
 // -------------------- AUTH --------------------
 
 // Login -> returns token (no JWT)
@@ -236,7 +298,7 @@ app.get("/kem-pubkey", requireAuth, async (req, res) => {
   });
 });
 
-// Upload: decapsulate+decrypt -> store plaintext + sha512
+// Upload: decapsulate+decrypt -> store encrypted-at-rest + sha512
 app.post("/upload-pq", requireAuth, uploadMem.single("cipher"), async (req, res) => {
   try {
     cleanupKemKeys();
@@ -264,35 +326,40 @@ app.post("/upload-pq", requireAuth, uploadMem.single("cipher"), async (req, res)
     const key32 = hkdfAesKey(sharedSecret);
     const plaintext = decryptAes256Gcm({ key32, iv, ciphertext, tag });
 
-    const checksum = sha512Hex(plaintext);
-
-    const id = uuid();
-    const safeOriginal = safeName(originalName);
-    const storedName = `${id}__${safeOriginal}`;
-    const plainPath = path.join(UPLOAD_PLAIN_DIR, storedName);
-    fs.writeFileSync(plainPath, plaintext);
-
-    db.files[id] = {
-      id,
+    const saved = persistEncryptedUpload({
       ownerClientId: req.client.clientId,
-      originalName: safeOriginal,
-      size: plaintext.length,
-      sha512: checksum,
-      state: "PLAINTEXT",
-      plainPath,
-      encPath: null,
-      encMeta: null,
-      uploadedAt: new Date().toISOString(),
-      encryptedAt: null,
-    };
-    saveDb(db);
+      originalName,
+      plaintext,
+    });
 
     kemKeys.delete(keyId);
 
-    res.json({ id, name: safeOriginal, size: plaintext.length, sha512: checksum, state: "PLAINTEXT" });
+    res.json(saved);
   } catch (e) {
     console.error(e);
     res.status(500).json({ error: "Decrypt/upload failed" });
+  }
+});
+
+// Upload plaintext directly (no client-side encryption)
+app.post("/upload-plain", requireAuth, uploadMem.single("file"), (req, res) => {
+  try {
+    const { originalName } = req.body || {};
+    const plaintext = req.file?.buffer;
+    if (!originalName || !plaintext) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
+
+    const saved = persistPlaintextUpload({
+      ownerClientId: req.client.clientId,
+      originalName,
+      plaintext: Buffer.from(plaintext),
+    });
+
+    return res.json(saved);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Plain upload failed" });
   }
 });
 

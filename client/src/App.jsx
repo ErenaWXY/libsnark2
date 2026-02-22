@@ -80,11 +80,31 @@ export default function App() {
   const [password, setPassword] = useState("alice123");
 
   const [file, setFile] = useState(null);
+  const [encryptBeforeSend, setEncryptBeforeSend] = useState(true);
   const [files, setFiles] = useState([]);
   const [status, setStatus] = useState("");
 
   function authHeaders() {
     return token ? { Authorization: `Bearer ${token}` } : {};
+  }
+
+  function clearAuth(message = "Session expired. Please login again.") {
+    setToken("");
+    localStorage.removeItem("demo_token");
+    setFiles([]);
+    setStatus(message);
+  }
+
+  async function authedFetch(url, options = {}) {
+    const res = await fetch(url, {
+      ...options,
+      headers: { ...(options.headers || {}), ...authHeaders() },
+    });
+    if (res.status === 401) {
+      clearAuth("Session expired (401). Please login again.");
+      throw new Error("Unauthorized");
+    }
+    return res;
   }
 
   async function refresh() {
@@ -93,7 +113,7 @@ export default function App() {
       return;
     }
     try {
-      const res = await fetch(`${API}/files`, { headers: { ...authHeaders() } });
+      const res = await authedFetch(`${API}/files`);
       const { json, text } = await readJsonSafe(res);
       if (!res.ok) throw new Error(json?.error || text || "refresh failed");
       setFiles(Array.isArray(json) ? json : []);
@@ -138,7 +158,7 @@ export default function App() {
   async function logout() {
     try {
       if (token) {
-        await fetch(`${API}/auth/logout`, { method: "POST", headers: { ...authHeaders() } });
+        await authedFetch(`${API}/auth/logout`, { method: "POST" });
       }
     } finally {
       setToken("");
@@ -157,54 +177,66 @@ export default function App() {
     }
 
     try {
-      setStatus("PQ handshake (ML-KEM-768)…");
+      if (encryptBeforeSend) {
+        setStatus("PQ handshake (ML-KEM-768)...");
 
-      // 1) Get ML-KEM-768 public key from server
-      const r1 = await fetch(`${API}/kem-pubkey`, { headers: { ...authHeaders() } });
-      const { json: j1, text: t1 } = await readJsonSafe(r1);
-      if (!r1.ok) throw new Error(j1?.error || t1 || "kem-pubkey failed");
+        // 1) Get ML-KEM-768 public key from server
+        const r1 = await authedFetch(`${API}/kem-pubkey`);
+        const { json: j1, text: t1 } = await readJsonSafe(r1);
+        if (!r1.ok) throw new Error(j1?.error || t1 || "kem-pubkey failed");
 
-      const { keyId, pkB64 } = j1;
-      const pk = bytesFromB64(pkB64);
+        const { keyId, pkB64 } = j1;
+        const pk = bytesFromB64(pkB64);
 
-      // 2) Encapsulate(pk) => (ct, sharedSecret)
-      await mlkemInit();
-      const { ct, sharedSecret } = await mlkemEncapsulate(pk);
+        // 2) Encapsulate(pk) => (ct, sharedSecret)
+        await mlkemInit();
+        const { ct, sharedSecret } = await mlkemEncapsulate(pk);
 
-      // 3) HKDF(sharedSecret) => AES-256-GCM key
-      const aesKey = await hkdfToAesKey(sharedSecret);
+        // 3) HKDF(sharedSecret) => AES-256-GCM key
+        const aesKey = await hkdfToAesKey(sharedSecret);
 
-      // 4) Encrypt file
-      setStatus("Encrypting file (AES-256-GCM)…");
-      const iv = crypto.getRandomValues(new Uint8Array(12));
-      const plain = new Uint8Array(await file.arrayBuffer());
+        // 4) Encrypt file on client
+        setStatus("Encrypting file (AES-256-GCM)...");
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const plain = new Uint8Array(await file.arrayBuffer());
 
-      const cipherWithTag = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, plain);
-      const { ciphertext, tag } = splitGcmTag(cipherWithTag);
+        const cipherWithTag = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, plain);
+        const { ciphertext, tag } = splitGcmTag(cipherWithTag);
 
-      // 5) Upload encrypted payload
-      setStatus("Uploading encrypted payload…");
-      const form = new FormData();
-      form.append("keyId", keyId);
-      form.append("kemCtB64", b64FromBytes(ct));
-      form.append("ivB64", b64FromBytes(iv));
-      form.append("tagB64", b64FromBytes(tag));
-      form.append("originalName", file.name);
-      form.append("cipher", new Blob([ciphertext]), "cipher.bin");
+        // 5) Upload encrypted payload
+        setStatus("Uploading encrypted payload...");
+        const form = new FormData();
+        form.append("keyId", keyId);
+        form.append("kemCtB64", b64FromBytes(ct));
+        form.append("ivB64", b64FromBytes(iv));
+        form.append("tagB64", b64FromBytes(tag));
+        form.append("originalName", file.name);
+        form.append("cipher", new Blob([ciphertext]), "cipher.bin");
 
-      const r2 = await fetch(`${API}/upload-pq`, {
-        method: "POST",
-        headers: { ...authHeaders() },
-        body: form,
-      });
-      const { json: j2, text: t2 } = await readJsonSafe(r2);
+        const r2 = await authedFetch(`${API}/upload-pq`, {
+          method: "POST",
+          body: form,
+        });
+        const { json: j2, text: t2 } = await readJsonSafe(r2);
+        if (!r2.ok) throw new Error(j2?.error || t2 || "Upload failed");
 
-      if (!r2.ok) {
-        setStatus(j2?.error || t2 || "Upload failed");
-        return;
+        setStatus(`Uploaded: ${j2.name} (encrypted before sending to backend)`);
+      } else {
+        setStatus("Uploading plaintext payload...");
+        const form = new FormData();
+        form.append("originalName", file.name);
+        form.append("file", file);
+
+        const r = await authedFetch(`${API}/upload-plain`, {
+          method: "POST",
+          body: form,
+        });
+        const { json, text } = await readJsonSafe(r);
+        if (!r.ok) throw new Error(json?.error || text || "Plain upload failed");
+
+        setStatus(`Uploaded: ${json.name} (plaintext sent to backend)`);
       }
 
-      setStatus(`Uploaded: ${j2.name} (sha512 stored server-side)`);
       setFile(null);
       await refresh();
     } catch (err) {
@@ -213,29 +245,11 @@ export default function App() {
     }
   }
 
-  async function encryptAtRest(fileId) {
-    try {
-      setStatus("Encrypting at rest (server-side)…");
-      const r = await fetch(`${API}/files/${fileId}/encrypt-at-rest`, {
-        method: "POST",
-        headers: { ...authHeaders() },
-      });
-      const { json, text } = await readJsonSafe(r);
-      if (!r.ok) throw new Error(json?.error || text || "encrypt-at-rest failed");
-      setStatus(`Encrypted at rest: ${fileId}`);
-      await refresh();
-    } catch (e) {
-      console.error(e);
-      setStatus(`Encrypt-at-rest failed: ${e?.message || e}`);
-    }
-  }
-
   async function deleteFile(fileId) {
     try {
       setStatus("Deleting…");
-      const r = await fetch(`${API}/files/${fileId}`, {
+      const r = await authedFetch(`${API}/files/${fileId}`, {
         method: "DELETE",
-        headers: { ...authHeaders() },
       });
       const { json, text } = await readJsonSafe(r);
       if (!r.ok) throw new Error(json?.error || text || "delete failed");
@@ -252,12 +266,12 @@ export default function App() {
       setStatus("Downloading…");
 
       // 1) manifest
-      const mRes = await fetch(`${API}/files/${f.id}/manifest`, { headers: { ...authHeaders() } });
+      const mRes = await authedFetch(`${API}/files/${f.id}/manifest`);
       const { json: manifest, text: mt } = await readJsonSafe(mRes);
       if (!mRes.ok) throw new Error(manifest?.error || mt || "manifest failed");
 
       // 2) download bytes
-      const res = await fetch(`${API}/files/${f.id}`, { headers: { ...authHeaders() } });
+      const res = await authedFetch(`${API}/files/${f.id}`);
       if (!res.ok) {
         const { json, text } = await readJsonSafe(res);
         throw new Error(json?.error || text || "download failed");
@@ -285,7 +299,7 @@ export default function App() {
 
   return (
     <div style={{ padding: 20, fontFamily: "system-ui" }}>
-      <h2>Demo: Username/Password Auth + Multi-client + PQ Upload + Integrity + Encrypt-at-rest</h2>
+      <h2>Demo: Username/Password Auth + Multi-client + Optional Client-side Encryption + Integrity</h2>
 
       {!token ? (
         <form onSubmit={login} style={{ marginBottom: 16 }}>
@@ -317,8 +331,17 @@ export default function App() {
 
       <form onSubmit={uploadFile} style={{ marginBottom: 16 }}>
         <input type="file" onChange={(e) => setFile(e.target.files?.[0] || null)} />
+        <label style={{ marginLeft: 8, fontSize: 13 }}>
+          <input
+            type="checkbox"
+            checked={encryptBeforeSend}
+            onChange={(e) => setEncryptBeforeSend(e.target.checked)}
+            style={{ marginRight: 4 }}
+          />
+          Encrypt before sending to backend
+        </label>
         <button type="submit" style={{ marginLeft: 8 }} disabled={!token}>
-          Upload (PQ)
+          Upload
         </button>
       </form>
 
@@ -340,16 +363,6 @@ export default function App() {
                 Download + Verify
               </button>
 
-              {f.state === "PLAINTEXT" && (
-                <button
-                  onClick={() => encryptAtRest(f.id)}
-                  style={{ marginLeft: 8 }}
-                  disabled={!token}
-                >
-                  Encrypt at rest (server)
-                </button>
-              )}
-
               <button
                 onClick={() => deleteFile(f.id)}
                 style={{ marginLeft: 8 }}
@@ -364,3 +377,5 @@ export default function App() {
     </div>
   );
 }
+
+
