@@ -80,7 +80,7 @@ export default function App() {
   const [password, setPassword] = useState("alice123");
 
   const [file, setFile] = useState(null);
-  const [encryptBeforeSend, setEncryptBeforeSend] = useState(true);
+  const [uploadMode, setUploadMode] = useState("encrypt_before_send");
   const [files, setFiles] = useState([]);
   const [status, setStatus] = useState("");
 
@@ -177,7 +177,7 @@ export default function App() {
     }
 
     try {
-      if (encryptBeforeSend) {
+      if (uploadMode === "encrypt_before_send") {
         setStatus("PQ handshake (ML-KEM-768)...");
 
         // 1) Get ML-KEM-768 public key from server
@@ -233,8 +233,15 @@ export default function App() {
         });
         const { json, text } = await readJsonSafe(r);
         if (!r.ok) throw new Error(json?.error || text || "Plain upload failed");
-
-        setStatus(`Uploaded: ${json.name} (plaintext sent to backend)`);
+        if (uploadMode === "encrypt_backend") {
+          setStatus("Encrypting file at backend...");
+          const r2 = await authedFetch(`${API}/files/${json.id}/encrypt-at-rest`, { method: "POST" });
+          const { json: j2, text: t2 } = await readJsonSafe(r2);
+          if (!r2.ok) throw new Error(j2?.error || t2 || "Backend encrypt failed");
+          setStatus(`Uploaded: ${json.name} (encrypted at backend)`);
+        } else {
+          setStatus(`Uploaded: ${json.name} (saved plaintext at backend)`);
+        }
       }
 
       setFile(null);
@@ -299,7 +306,7 @@ export default function App() {
 
   return (
     <div style={{ padding: 20, fontFamily: "system-ui" }}>
-      <h2>Demo: Username/Password Auth + Multi-client + Optional Client-side Encryption + Integrity</h2>
+      <h2>Demo: Username/Password Auth + Multi-client + 3 Upload Modes + Integrity</h2>
 
       {!token ? (
         <form onSubmit={login} style={{ marginBottom: 16 }}>
@@ -332,13 +339,12 @@ export default function App() {
       <form onSubmit={uploadFile} style={{ marginBottom: 16 }}>
         <input type="file" onChange={(e) => setFile(e.target.files?.[0] || null)} />
         <label style={{ marginLeft: 8, fontSize: 13 }}>
-          <input
-            type="checkbox"
-            checked={encryptBeforeSend}
-            onChange={(e) => setEncryptBeforeSend(e.target.checked)}
-            style={{ marginRight: 4 }}
-          />
-          Encrypt before sending to backend
+          Upload mode:{" "}
+          <select value={uploadMode} onChange={(e) => setUploadMode(e.target.value)}>
+            <option value="plain">Save plain</option>
+            <option value="encrypt_backend">Encrypt at backend side</option>
+            <option value="encrypt_before_send">Encrypt before sending to backend</option>
+          </select>
         </label>
         <button type="submit" style={{ marginLeft: 8 }} disabled={!token}>
           Upload
