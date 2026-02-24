@@ -248,6 +248,38 @@ function persistEncryptedUpload({ ownerClientId, originalName, plaintext }) {
   return { id, name: safeOriginal, size: plaintext.length, sha512: checksum, state: "ENCRYPTED_AT_REST" };
 }
 
+function persistClientEncryptedUpload({
+  ownerClientId,
+  originalName,
+  encryptedBytes,
+  clientEncMeta,
+}) {
+  const checksum = sha512Hex(encryptedBytes);
+  const id = uuid();
+  const safeOriginal = safeName(originalName);
+  const encName = `${id}__${safeOriginal}.client.enc`;
+  const encPath = path.join(UPLOAD_ENC_DIR, encName);
+  fs.writeFileSync(encPath, encryptedBytes);
+
+  db.files[id] = {
+    id,
+    ownerClientId,
+    originalName: safeOriginal,
+    size: encryptedBytes.length,
+    sha512: checksum,
+    state: "CLIENT_ENCRYPTED",
+    plainPath: null,
+    encPath,
+    encMeta: null,
+    clientEncMeta,
+    uploadedAt: new Date().toISOString(),
+    encryptedAt: new Date().toISOString(),
+  };
+  saveDb(db);
+
+  return { id, name: safeOriginal, size: encryptedBytes.length, sha512: checksum, state: "CLIENT_ENCRYPTED" };
+}
+
 // -------------------- AUTH --------------------
 
 // Login -> returns token (no JWT)
@@ -363,6 +395,42 @@ app.post("/upload-plain", requireAuth, uploadMem.single("file"), (req, res) => {
   }
 });
 
+// Upload already-encrypted payload from client (password-derived key)
+app.post("/upload-client-encrypted", requireAuth, uploadMem.single("cipher"), (req, res) => {
+  try {
+    const { originalName, saltB64, ivB64, kdf } = req.body || {};
+    const encryptedBytes = req.file?.buffer;
+
+    if (!originalName || !saltB64 || !ivB64 || !kdf || !encryptedBytes) {
+      return res.status(400).json({ error: "Missing fields" });
+    }
+
+    const kdfObj = JSON.parse(String(kdf));
+    const clientEncMeta = {
+      alg: "AES-256-GCM",
+      kdf: {
+        name: "PBKDF2",
+        hash: String(kdfObj?.hash || "SHA-256"),
+        iterations: Number(kdfObj?.iterations || 310000),
+      },
+      saltB64: String(saltB64),
+      ivB64: String(ivB64),
+    };
+
+    const saved = persistClientEncryptedUpload({
+      ownerClientId: req.client.clientId,
+      originalName,
+      encryptedBytes: Buffer.from(encryptedBytes),
+      clientEncMeta,
+    });
+
+    return res.json(saved);
+  } catch (e) {
+    console.error(e);
+    return res.status(500).json({ error: "Client-encrypted upload failed" });
+  }
+});
+
 // List files (per user)
 app.get("/files", requireAuth, (req, res) => {
   const list = Object.values(db.files).filter((f) => f.ownerClientId === req.client.clientId);
@@ -381,6 +449,7 @@ app.get("/files/:id/manifest", requireAuth, (req, res) => {
     size: meta.size,
     sha512: meta.sha512,
     state: meta.state,
+    clientEncMeta: meta.clientEncMeta || null,
     uploadedAt: meta.uploadedAt,
     encryptedAt: meta.encryptedAt,
   });
@@ -395,6 +464,9 @@ app.post("/files/:id/encrypt-at-rest", requireAuth, (req, res) => {
 
     if (meta.state === "ENCRYPTED_AT_REST") {
       return res.json({ ok: true, state: meta.state, message: "Already encrypted" });
+    }
+    if (meta.state === "CLIENT_ENCRYPTED") {
+      return res.json({ ok: true, state: meta.state, message: "Already client-encrypted" });
     }
     if (!meta.plainPath || !fs.existsSync(meta.plainPath)) {
       return res.status(404).json({ error: "Plaintext missing on disk" });
@@ -460,6 +532,11 @@ app.get("/files/:id", requireAuth, (req, res) => {
       return res.end(plaintext);
     }
 
+    if (meta.state === "CLIENT_ENCRYPTED") {
+      if (!meta.encPath || !fs.existsSync(meta.encPath)) return res.status(404).json({ error: "Missing encrypted blob" });
+      return res.download(meta.encPath, `${meta.originalName}.enc`);
+    }
+
     return res.status(400).json({ error: "Unknown state" });
   } catch (e) {
     console.error(e);
@@ -478,7 +555,7 @@ app.delete("/files/:id", requireAuth, (req, res) => {
     try {
       if (meta.state === "PLAINTEXT") {
         if (meta.plainPath && fs.existsSync(meta.plainPath)) fs.unlinkSync(meta.plainPath);
-      } else if (meta.state === "ENCRYPTED_AT_REST") {
+      } else if (meta.state === "ENCRYPTED_AT_REST" || meta.state === "CLIENT_ENCRYPTED") {
         if (meta.encPath && fs.existsSync(meta.encPath)) fs.unlinkSync(meta.encPath);
       }
     } catch (e) {

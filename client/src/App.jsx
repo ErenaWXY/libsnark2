@@ -1,8 +1,9 @@
 // client/src/App.jsx
 import { useEffect, useState } from "react";
-import { mlkemEncapsulate, mlkemInit } from "./mlkem.js";
 
 const API = "http://localhost:4000";
+const PBKDF2_ITERATIONS = 310000;
+const PBKDF2_HASH = "SHA-256";
 
 // ---------- helpers ----------
 function b64FromBytes(bytes) {
@@ -30,27 +31,21 @@ async function readJsonSafe(res) {
   }
 }
 
-async function hkdfToAesKey(sharedSecretBytes) {
-  const ikmKey = await crypto.subtle.importKey("raw", sharedSecretBytes, "HKDF", false, ["deriveKey"]);
+async function derivePasswordAesKey(password, saltBytes, iterations, hash, usages) {
+  const pwdBytes = new TextEncoder().encode(password);
+  const pwdKey = await crypto.subtle.importKey("raw", pwdBytes, "PBKDF2", false, ["deriveKey"]);
   return crypto.subtle.deriveKey(
     {
-      name: "HKDF",
-      hash: "SHA-256",
-      salt: new Uint8Array([]),
-      info: new TextEncoder().encode("pq-upload-aes-256-key"),
+      name: "PBKDF2",
+      hash,
+      salt: saltBytes,
+      iterations,
     },
-    ikmKey,
+    pwdKey,
     { name: "AES-GCM", length: 256 },
     false,
-    ["encrypt"]
+    usages
   );
-}
-
-function splitGcmTag(cipherWithTag) {
-  const all = new Uint8Array(cipherWithTag);
-  const tag = all.slice(all.length - 16);
-  const ciphertext = all.slice(0, all.length - 16);
-  return { ciphertext, tag };
 }
 
 function bytesToHex(bytes) {
@@ -125,10 +120,6 @@ export default function App() {
 
   useEffect(() => {
     if (token) refresh();
-    mlkemInit().catch((e) => {
-      console.error(e);
-      setStatus("ML-KEM WASM init failed. Check /public/mlkem768/*.mjs/.wasm is served.");
-    });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token]);
 
@@ -178,49 +169,52 @@ export default function App() {
 
     try {
       if (uploadMode === "encrypt_before_send") {
-        setStatus("PQ handshake (ML-KEM-768)...");
+        const password = window.prompt("Enter password to encrypt this file before upload:");
+        if (!password) {
+          setStatus("Upload canceled: password is required.");
+          return;
+        }
 
-        // 1) Get ML-KEM-768 public key from server
-        const r1 = await authedFetch(`${API}/kem-pubkey`);
-        const { json: j1, text: t1 } = await readJsonSafe(r1);
-        if (!r1.ok) throw new Error(j1?.error || t1 || "kem-pubkey failed");
-
-        const { keyId, pkB64 } = j1;
-        const pk = bytesFromB64(pkB64);
-
-        // 2) Encapsulate(pk) => (ct, sharedSecret)
-        await mlkemInit();
-        const { ct, sharedSecret } = await mlkemEncapsulate(pk);
-
-        // 3) HKDF(sharedSecret) => AES-256-GCM key
-        const aesKey = await hkdfToAesKey(sharedSecret);
-
-        // 4) Encrypt file on client
-        setStatus("Encrypting file (AES-256-GCM)...");
+        setStatus("Deriving encryption key (PBKDF2)...");
+        const salt = crypto.getRandomValues(new Uint8Array(16));
         const iv = crypto.getRandomValues(new Uint8Array(12));
+        const aesKey = await derivePasswordAesKey(
+          password,
+          salt,
+          PBKDF2_ITERATIONS,
+          PBKDF2_HASH,
+          ["encrypt"]
+        );
+
+        setStatus("Encrypting file on client (AES-256-GCM)...");
         const plain = new Uint8Array(await file.arrayBuffer());
+        const cipherWithTag = new Uint8Array(
+          await crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, plain)
+        );
 
-        const cipherWithTag = await crypto.subtle.encrypt({ name: "AES-GCM", iv }, aesKey, plain);
-        const { ciphertext, tag } = splitGcmTag(cipherWithTag);
-
-        // 5) Upload encrypted payload
-        setStatus("Uploading encrypted payload...");
+        setStatus("Uploading client-encrypted payload...");
         const form = new FormData();
-        form.append("keyId", keyId);
-        form.append("kemCtB64", b64FromBytes(ct));
-        form.append("ivB64", b64FromBytes(iv));
-        form.append("tagB64", b64FromBytes(tag));
         form.append("originalName", file.name);
-        form.append("cipher", new Blob([ciphertext]), "cipher.bin");
+        form.append("saltB64", b64FromBytes(salt));
+        form.append("ivB64", b64FromBytes(iv));
+        form.append(
+          "kdf",
+          JSON.stringify({
+            name: "PBKDF2",
+            hash: PBKDF2_HASH,
+            iterations: PBKDF2_ITERATIONS,
+          })
+        );
+        form.append("cipher", new Blob([cipherWithTag]), "cipher.bin");
 
-        const r2 = await authedFetch(`${API}/upload-pq`, {
+        const r2 = await authedFetch(`${API}/upload-client-encrypted`, {
           method: "POST",
           body: form,
         });
         const { json: j2, text: t2 } = await readJsonSafe(r2);
         if (!r2.ok) throw new Error(j2?.error || t2 || "Upload failed");
 
-        setStatus(`Uploaded: ${j2.name} (encrypted before sending to backend)`);
+        setStatus(`Uploaded: ${j2.name} (client-encrypted with password)`);
       } else {
         setStatus("Uploading plaintext payload...");
         const form = new FormData();
@@ -270,7 +264,7 @@ export default function App() {
 
   async function downloadAndVerify(f) {
     try {
-      setStatus("Downloading…");
+      setStatus("Downloading...");
 
       // 1) manifest
       const mRes = await authedFetch(`${API}/files/${f.id}/manifest`);
@@ -286,18 +280,54 @@ export default function App() {
 
       const buf = await res.arrayBuffer();
 
-      // 3) verify SHA-512
-      setStatus("Verifying SHA-512…");
+      // 3) verify SHA-512 on downloaded bytes
+      setStatus("Verifying SHA-512...");
       const got = (await sha512Hex(buf)).toLowerCase();
       const expected = String(manifest.sha512 || "").toLowerCase();
-
       if (got !== expected) {
-        setStatus("❌ Integrity FAILED (SHA-512 mismatch). Not saving file.");
+        setStatus("Integrity FAILED (SHA-512 mismatch). Not saving file.");
+        return;
+      }
+
+      if (manifest.state === "CLIENT_ENCRYPTED") {
+        const password = window.prompt("Enter password to decrypt this file:");
+        if (!password) {
+          setStatus("Download canceled: password is required to decrypt.");
+          return;
+        }
+
+        const meta = manifest.clientEncMeta || {};
+        const kdf = meta.kdf || {};
+        const salt = bytesFromB64(String(meta.saltB64 || ""));
+        const iv = bytesFromB64(String(meta.ivB64 || ""));
+        if (!salt.length || !iv.length) {
+          throw new Error("Missing client encryption metadata");
+        }
+
+        setStatus("Deriving decryption key (PBKDF2)...");
+        const aesKey = await derivePasswordAesKey(
+          password,
+          salt,
+          Number(kdf.iterations || PBKDF2_ITERATIONS),
+          String(kdf.hash || PBKDF2_HASH),
+          ["decrypt"]
+        );
+
+        setStatus("Decrypting file on client...");
+        let plain;
+        try {
+          plain = await crypto.subtle.decrypt({ name: "AES-GCM", iv }, aesKey, buf);
+        } catch {
+          throw new Error("Decryption failed. Password may be incorrect.");
+        }
+
+        downloadBlob(new Blob([plain], { type: "application/octet-stream" }), manifest.originalName);
+        setStatus("Downloaded + decrypted successfully.");
         return;
       }
 
       downloadBlob(new Blob([buf], { type: "application/octet-stream" }), manifest.originalName);
-      setStatus("✅ Downloaded + verified (SHA-512 match).");
+      setStatus("Downloaded + verified (SHA-512 match).");
     } catch (e) {
       console.error(e);
       setStatus(`Download/verify failed: ${e?.message || e}`);
@@ -306,7 +336,7 @@ export default function App() {
 
   return (
     <div style={{ padding: 20, fontFamily: "system-ui" }}>
-      <h2>Demo: Username/Password Auth + Multi-client + 3 Upload Modes + Integrity</h2>
+      <h2>Demo: Username/Password Auth + Multi-client + 3 Upload Modes + Integrity + Password Encryption</h2>
 
       {!token ? (
         <form onSubmit={login} style={{ marginBottom: 16 }}>
@@ -338,12 +368,12 @@ export default function App() {
 
       <form onSubmit={uploadFile} style={{ marginBottom: 16 }}>
         <input type="file" onChange={(e) => setFile(e.target.files?.[0] || null)} />
-        <label style={{ marginLeft: 8, fontSize: 13 }}>
+        <label style={{ marginLeft: 8, fontSize: 13, fontWeight: "bold" }}>
           Upload mode:{" "}
           <select value={uploadMode} onChange={(e) => setUploadMode(e.target.value)}>
             <option value="plain">Save plain</option>
             <option value="encrypt_backend">Encrypt at backend side</option>
-            <option value="encrypt_before_send">Encrypt before sending to backend</option>
+            <option value="encrypt_before_send">Encrypt before sending (password)</option>
           </select>
         </label>
         <button type="submit" style={{ marginLeft: 8 }} disabled={!token}>
@@ -383,5 +413,8 @@ export default function App() {
     </div>
   );
 }
+
+
+
 
 
