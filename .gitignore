@@ -1,0 +1,11 @@
+node_modules/
+server/node_modules/
+client/node_modules/
+target/
+porep-cache/
+proof-params/
+server/uploads_plain/
+
+.env
+*.log
+.DS_Store

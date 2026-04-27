@@ -1,0 +1,3 @@
+[submodule "third_party/rust-fil-proofs"]
+	path = third_party/rust-fil-proofs
+	url = https://github.com/filecoin-project/rust-fil-proofs.git

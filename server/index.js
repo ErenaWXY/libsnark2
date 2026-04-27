@@ -1,4 +1,3 @@
-// server/index.js
 import express from "express";
 import cors from "cors";
 import multer from "multer";
@@ -11,22 +10,24 @@ import { mlkemKeypair, mlkemDecapsulate } from "./pqkem.js";
 
 const app = express();
 const PORT = 4000;
+const POREP_API = "http://127.0.0.1:8787";
 
-app.use(cors({ origin: "http://localhost:5173" })); // adjust for your FE origin
+app.use(cors({
+  origin: ["http://localhost:5173", "http://127.0.0.1:5173"]
+}));
 app.use(express.json({ limit: "2mb" }));
 
-const uploadDisk = multer({ dest: "uploads_tmp" });
 const uploadMem = multer({ storage: multer.memoryStorage() });
 
 const UPLOAD_DIR = path.resolve("uploads_plain");
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
-// Simple in-memory “DB”
+// Simple in-memory DB
 const files = new Map();
 
 // Store server-side ML-KEM secret keys by keyId (short-lived)
-const kemKeys = new Map(); // keyId -> { sk: Uint8Array, pk: Uint8Array, createdAt: number }
-const KEM_TTL_MS = 10 * 60 * 1000; // 10 minutes
+const kemKeys = new Map();
+const KEM_TTL_MS = 10 * 60 * 1000;
 
 function cleanupKemKeys() {
   const now = Date.now();
@@ -40,14 +41,13 @@ function safeName(name) {
 }
 
 function hkdfAesKey(sharedSecretBytes) {
-  // sharedSecretBytes: Buffer | Uint8Array
   const ss = Buffer.from(sharedSecretBytes);
   return crypto.hkdfSync(
     "sha256",
     ss,
     Buffer.alloc(0),
     Buffer.from("pq-upload-aes-256-key"),
-    32 // 32 bytes = AES-256
+    32
   );
 }
 
@@ -59,14 +59,42 @@ function decryptAes256Gcm({ key32, iv, ciphertext, tag }) {
   return Buffer.concat([p1, p2]);
 }
 
-/**
- * PQ handshake: server generates a fresh ML-KEM keypair and returns pk to client.
- * Client does encapsulate(pk) -> (ct, ss) and sends ct + AES-GCM encrypted file.
- */
+async function startPoRepSeal(fileMeta, outPath) {
+  try {
+    fileMeta.porep.state = "sealing";
+    fileMeta.porep.error = null;
+
+    const r = await fetch(`${POREP_API}/seal-file`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        file_id: fileMeta.id,
+        path: outPath,
+      }),
+    });
+
+    const data = await r.json();
+
+    if (!r.ok) {
+      fileMeta.porep.state = "failed";
+      fileMeta.porep.error = data?.error || "seal-file failed";
+      return;
+    }
+
+    fileMeta.porep.jobId = data.job_id;
+    fileMeta.porep.state = data.state || "sealing";
+    fileMeta.porep.cacheDir = data.cache_dir || null;
+  } catch (e) {
+    console.error("PoRep seal-file error:", e);
+    fileMeta.porep.state = "failed";
+    fileMeta.porep.error = String(e.message || e);
+  }
+}
+
 app.get("/kem-pubkey", async (req, res) => {
   cleanupKemKeys();
 
-  const { pk, sk } = await mlkemKeypair(); // Uint8Array, Uint8Array
+  const { pk, sk } = await mlkemKeypair();
   const keyId = uuid();
 
   kemKeys.set(keyId, { pk, sk, createdAt: Date.now() });
@@ -79,16 +107,6 @@ app.get("/kem-pubkey", async (req, res) => {
   });
 });
 
-/**
- * Upload encrypted (PQ application-layer):
- * multipart form-data fields:
- * - keyId: string
- * - kemCtB64: base64(ML-KEM ciphertext)
- * - ivB64: base64(12 bytes)
- * - tagB64: base64(16 bytes)
- * - originalName: string
- * - cipher: file (binary)  <-- AES-GCM ciphertext without tag
- */
 app.post("/upload-pq", uploadMem.single("cipher"), async (req, res) => {
   try {
     cleanupKemKeys();
@@ -109,37 +127,47 @@ app.post("/upload-pq", uploadMem.single("cipher"), async (req, res) => {
     if (iv.length !== 12) return res.status(400).json({ error: "IV must be 12 bytes" });
     if (tag.length !== 16) return res.status(400).json({ error: "Tag must be 16 bytes" });
 
-    // Decapsulate -> shared secret
     const sharedSecret = await mlkemDecapsulate(new Uint8Array(kemCt), kemObj.sk);
-
-    // Derive AES-256 key
     const key32 = hkdfAesKey(sharedSecret);
-
-    // Decrypt to plaintext (stored unencrypted)
     const plaintext = decryptAes256Gcm({ key32, iv, ciphertext, tag });
 
-    // Save plaintext on disk
     const id = uuid();
     const safeOriginal = safeName(originalName);
     const storedName = `${id}__${safeOriginal}`;
     const outPath = path.join(UPLOAD_DIR, storedName);
     fs.writeFileSync(outPath, plaintext);
 
-    files.set(id, {
+    const meta = {
       id,
       originalName: safeOriginal,
       storedName,
       size: plaintext.length,
       uploadedAt: new Date().toISOString(),
-    });
+      porep: {
+        state: "pending",
+        jobId: null,
+        commD: null,
+        commR: null,
+        proof: null,
+        sealedAt: null,
+        verified: null,
+        verifyMessage: null,
+        error: null,
+      },
+    };
 
-    // one-time use keyId (recommended)
+    files.set(id, meta);
+
     kemKeys.delete(keyId);
+
+    // fire-and-forget seal
+    startPoRepSeal(meta, outPath);
 
     res.json({
       id,
       name: safeOriginal,
       size: plaintext.length,
+      porepState: meta.porep.state,
       downloadUrl: `http://localhost:${PORT}/files/${id}`,
     });
   } catch (e) {
@@ -148,12 +176,10 @@ app.post("/upload-pq", uploadMem.single("cipher"), async (req, res) => {
   }
 });
 
-// List plaintext files
 app.get("/files", (req, res) => {
   res.json(Array.from(files.values()));
 });
 
-// Download plaintext file
 app.get("/files/:id", (req, res) => {
   const meta = files.get(req.params.id);
   if (!meta) return res.status(404).json({ error: "Not found" });
@@ -162,6 +188,83 @@ app.get("/files/:id", (req, res) => {
   if (!fs.existsSync(filePath)) return res.status(404).json({ error: "Missing on disk" });
 
   res.download(filePath, meta.originalName);
+});
+
+app.get("/files/:id/porep/status", async (req, res) => {
+  const meta = files.get(req.params.id);
+  if (!meta) return res.status(404).json({ error: "Not found" });
+
+  if (!meta.porep?.jobId) {
+    return res.json({
+      id: meta.id,
+      porep: meta.porep,
+    });
+  }
+
+  try {
+    const r = await fetch(`${POREP_API}/jobs/${meta.porep.jobId}`);
+    const data = await r.json();
+
+    if (r.ok) {
+      meta.porep.state = data.state || meta.porep.state;
+      meta.porep.commD = data.comm_d || meta.porep.commD;
+      meta.porep.commR = data.comm_r || meta.porep.commR;
+      meta.porep.proof = data.proof || meta.porep.proof;
+      meta.porep.error = data.error || meta.porep.error;
+    }
+
+    res.json({
+      id: meta.id,
+      porep: meta.porep,
+    });
+  } catch (e) {
+    res.status(500).json({ error: "Failed to query PoRep status" });
+if (r.ok) {
+  meta.porep.state = data.state || meta.porep.state;
+  meta.porep.error = data.error || meta.porep.error;
+  meta.porep.cacheDir = data.cache_dir || meta.porep.cacheDir;
+  meta.porep.helperStdout = data.stdout || meta.porep.helperStdout;
+  meta.porep.helperStderr = data.stderr || meta.porep.helperStderr;
+}  }
+});
+
+app.post("/files/:id/porep/verify", async (req, res) => {
+  const meta = files.get(req.params.id);
+  if (!meta) return res.status(404).json({ error: "Not found" });
+
+  if (!meta.porep?.jobId) {
+    return res.status(400).json({ error: "PoRep job not ready" });
+  }
+
+  try {
+    const r = await fetch(`${POREP_API}/verify`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        job_id: meta.porep.jobId,
+      }),
+    });
+
+    const data = await r.json();
+
+    if (!r.ok) {
+      return res.status(500).json({ error: data?.error || "Verify failed" });
+    }
+
+    meta.porep.verified = !!data.ok;
+    meta.porep.verifyMessage = data.message || null;
+
+    res.json({
+      id: meta.id,
+      verified: meta.porep.verified,
+      message: meta.porep.verifyMessage,
+    });
+  } catch (e) {
+    console.error(e);
+    res.status(500).json({ error: "Failed to verify PoRep" });
+  }
 });
 
 app.listen(PORT, () => console.log(`Server running on http://localhost:${PORT}`));

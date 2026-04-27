@@ -1,4 +1,3 @@
-// client/src/App.jsx
 import { useEffect, useState } from "react";
 import { mlkemEncapsulate, mlkemInit } from "./mlkem.js";
 
@@ -21,7 +20,6 @@ function bytesFromB64(b64) {
 }
 
 async function hkdfToAesKey(sharedSecretBytes) {
-  // sharedSecretBytes: Uint8Array
   const ikmKey = await crypto.subtle.importKey(
     "raw",
     sharedSecretBytes,
@@ -45,7 +43,6 @@ async function hkdfToAesKey(sharedSecretBytes) {
 }
 
 function splitGcmTag(cipherWithTag) {
-  // WebCrypto returns ciphertext||tag (tag is last 16 bytes for 128-bit GCM tag)
   const all = new Uint8Array(cipherWithTag);
   const tag = all.slice(all.length - 16);
   const ciphertext = all.slice(0, all.length - 16);
@@ -65,7 +62,6 @@ export default function App() {
 
   useEffect(() => {
     refresh();
-    // init ML-KEM wasm once
     mlkemInit().catch(() => {});
   }, []);
 
@@ -76,21 +72,17 @@ export default function App() {
     try {
       setStatus("PQ handshake…");
 
-      // 1) Get ML-KEM public key from server
       const r1 = await fetch(`${API}/kem-pubkey`);
       const { keyId, pkB64 } = await r1.json();
       if (!r1.ok) throw new Error("kem-pubkey failed");
 
       const pk = bytesFromB64(pkB64);
 
-      // 2) ML-KEM encapsulate(pk) => (ct, sharedSecret)
       await mlkemInit();
       const { ct, sharedSecret } = await mlkemEncapsulate(pk);
 
-      // 3) HKDF(sharedSecret) => AES-256-GCM key
       const aesKey = await hkdfToAesKey(sharedSecret);
 
-      // 4) Encrypt file (AES-256-GCM)
       setStatus("Encrypting file (AES-256-GCM)…");
       const iv = crypto.getRandomValues(new Uint8Array(12));
       const plain = new Uint8Array(await file.arrayBuffer());
@@ -103,7 +95,6 @@ export default function App() {
 
       const { ciphertext, tag } = splitGcmTag(cipherWithTag);
 
-      // 5) Upload encrypted payload; server decrypts and stores plaintext
       setStatus("Uploading encrypted…");
       const form = new FormData();
       form.append("keyId", keyId);
@@ -111,8 +102,6 @@ export default function App() {
       form.append("ivB64", b64FromBytes(iv));
       form.append("tagB64", b64FromBytes(tag));
       form.append("originalName", file.name);
-
-      // send ciphertext as a "file" field named "cipher"
       form.append("cipher", new Blob([ciphertext]), "cipher.bin");
 
       const r2 = await fetch(`${API}/upload-pq`, { method: "POST", body: form });
@@ -123,7 +112,7 @@ export default function App() {
         return;
       }
 
-      setStatus(`Uploaded: ${data2.name}`);
+      setStatus(`Uploaded: ${data2.name}. PoRep sealing started...`);
       setFile(null);
       await refresh();
     } catch (err) {
@@ -132,9 +121,45 @@ export default function App() {
     }
   }
 
+  async function refreshPoRepStatus(fileId) {
+    try {
+      const r = await fetch(`${API}/files/${fileId}/porep/status`);
+      const data = await r.json();
+      if (!r.ok) {
+        setStatus(data?.error || "Failed to refresh PoRep status");
+        return;
+      }
+      await refresh();
+    } catch (e) {
+      console.error(e);
+      setStatus("Failed to refresh PoRep status");
+    }
+  }
+
+  async function verifyPoRep(fileId) {
+    try {
+      setStatus("Verifying proof...");
+      const r = await fetch(`${API}/files/${fileId}/porep/verify`, {
+        method: "POST",
+      });
+      const data = await r.json();
+
+      if (!r.ok) {
+        setStatus(data?.error || "Verify failed");
+        return;
+      }
+
+      setStatus(data?.message || "Verification finished");
+      await refresh();
+    } catch (e) {
+      console.error(e);
+      setStatus("Verify request failed");
+    }
+  }
+
   return (
     <div style={{ padding: 20, fontFamily: "system-ui" }}>
-      <h2>File Upload + Download</h2>
+      <h2>File Upload + Download + PoRep Demo</h2>
 
       <form onSubmit={uploadFile} style={{ marginBottom: 16 }}>
         <input type="file" onChange={(e) => setFile(e.target.files?.[0] || null)} />
@@ -146,9 +171,66 @@ export default function App() {
       <h3>Files</h3>
       <ul>
         {files.map((f) => (
-          <li key={f.id}>
-            {f.originalName} ({Math.round((f.size || 0) / 1024)} KB) —{" "}
-            <a href={`${API}/files/${f.id}`}>Download</a>
+          <li key={f.id} style={{ marginBottom: 16 }}>
+            <div>
+              <strong>{f.originalName}</strong> ({Math.round((f.size || 0) / 1024)} KB)
+            </div>
+
+            <div>
+              <a href={`${API}/files/${f.id}`}>Download</a>
+            </div>
+
+            <div style={{ marginTop: 6 }}>
+              PoRep state: <strong>{f.porep?.state || "N/A"}</strong>
+            </div>
+
+            {f.porep?.jobId && (
+              <div style={{ fontSize: 12, marginTop: 4 }}>
+                jobId: {f.porep.jobId}
+              </div>
+            )}
+
+            {f.porep?.commD && (
+              <div style={{ fontSize: 12, marginTop: 4 }}>
+                commD: {f.porep.commD.slice(0, 24)}...
+              </div>
+            )}
+
+            {f.porep?.commR && (
+              <div style={{ fontSize: 12, marginTop: 4 }}>
+                commR: {f.porep.commR.slice(0, 24)}...
+              </div>
+            )}
+
+            {f.porep?.verified !== null && (
+              <div style={{ marginTop: 4 }}>
+                Verified: <strong>{String(f.porep.verified)}</strong>
+              </div>
+            )}
+
+            {f.porep?.verifyMessage && (
+              <div style={{ fontSize: 12, marginTop: 4 }}>
+                {f.porep.verifyMessage}
+              </div>
+            )}
+
+            {f.porep?.error && (
+              <div style={{ color: "red", marginTop: 4 }}>
+                Error: {f.porep.error}
+              </div>
+            )}
+
+            <div style={{ marginTop: 8 }}>
+              <button onClick={() => refreshPoRepStatus(f.id)} style={{ marginRight: 8 }}>
+                Refresh PoRep Status
+              </button>
+              <button
+                onClick={() => verifyPoRep(f.id)}
+                disabled={f.porep?.state !== "proved"}
+              >
+                Verify
+              </button>
+            </div>
           </li>
         ))}
       </ul>
