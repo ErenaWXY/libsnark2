@@ -33,19 +33,29 @@ fn main() {
     }
 
     let input = PathBuf::from(&input_path);
-    if !input.exists() {
-        eprintln!("input file does not exist: {}", input_path);
-        std::process::exit(2);
-    }
 
-    // Important:
-    // benchy porep --preserve-cache requires cache_dir to NOT exist before running.
-    // So if an old failed cache directory exists, remove it first.
-    let cache_path = PathBuf::from(&cache_dir);
-    if cache_path.exists() {
-        fs::remove_dir_all(&cache_path).expect("failed to remove existing cache dir");
-    }
+    let input_bytes =
+        fs::read(&input).expect("failed to read input file");
 
+    fs::create_dir_all(&cache_dir)
+        .expect("failed to create cache dir");
+
+    let sector_size: usize = 8388608;
+
+    let mut staged = vec![0u8; sector_size];
+
+    let copy_len = input_bytes.len().min(sector_size);
+
+    staged[..copy_len]
+        .copy_from_slice(&input_bytes[..copy_len]);
+
+    let staged_path =
+        PathBuf::from(&cache_dir).join("staged-file");
+
+    fs::write(&staged_path, &staged)
+        .expect("failed to write staged-file");
+
+    // ⭐ 关键新增：执行 sealing pipeline
     let benchy_path =
         "/home/xinyue/libsnark2/third_party/rust-fil-proofs/target/release/benchy";
 
@@ -73,9 +83,14 @@ fn main() {
         file_id,
         input_path,
         cache_dir,
-        sector_size: 2048,
-        message: "PoRep sealing completed successfully and cache was preserved".to_string(),
+        sector_size: 8388608,
+        message: format!(
+            "PoRep sealing completed successfully"
+        ),
     };
 
-    println!("{}", serde_json::to_string(&result).unwrap());
+    println!(
+        "{}",
+        serde_json::to_string(&result).unwrap()
+    );
 }

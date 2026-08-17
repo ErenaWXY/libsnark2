@@ -9,3 +9,17 @@ server/uploads_plain/
 .env
 *.log
 .DS_Store
+
+# Runtime upload data
+server/uploads_cipher/
+tmp-2k-cache/
+
+# Generated RISC Zero proofs
+*.receipt
+
+# Frontend build output
+client/dist/
+
+# Keep only the 2 KiB demo fixture
+benchmark-small/*
+!benchmark-small/test_2k.bin
